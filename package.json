@@ -4,16 +4,19 @@
   "description": "Second Nature's incremental Oxlint rule ratchet",
   "type": "module",
   "bin": {
-    "oxlint-ratchet": "./oxlint-ratchet.mjs"
+    "oxlint-ratchet": "./oxlint-ratchet.mjs",
+    "oxlint-ratchet-metrics": "./lint-ratchet-metrics.mjs"
   },
   "exports": {
-    ".": "./oxlint-ratchet.mjs"
+    ".": "./oxlint-ratchet.mjs",
+    "./metrics": "./lint-ratchet-metrics.mjs"
   },
   "scripts": {
-    "test": "node --test oxlint-ratchet.node.test.mjs"
+    "test": "node --test *.node.test.mjs"
   },
   "files": [
-    "oxlint-ratchet.mjs"
+    "oxlint-ratchet.mjs",
+    "lint-ratchet-metrics.mjs"
   ],
   "author": "Second Nature",
   "license": "UNLICENSED",
