@@ -30,3 +30,7 @@ adopting scope. Without `--ratchet-only`, it also runs standard Oxlint.
 The package exports `normalizeRule`, `parseRatchet`, `formatRatchet`,
 `workspaceDirectories`, `readScopes`, and `classifyDiagnostics` for consumers
 that analyze baseline changes.
+
+`oxlint-ratchet-metrics <base-ref> <sha> <recorded-at> <contributor>` writes
+JSON Lines showing baseline changes by scope and rule. The caller can publish
+that snapshot where it keeps engineering metrics.
