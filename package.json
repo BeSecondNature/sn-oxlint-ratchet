@@ -1,0 +1,23 @@
+{
+  "name": "@second-nature/oxlint-ratchet",
+  "version": "1.0.0",
+  "description": "Second Nature's incremental Oxlint rule ratchet",
+  "type": "module",
+  "bin": {
+    "oxlint-ratchet": "./oxlint-ratchet.mjs"
+  },
+  "exports": {
+    ".": "./oxlint-ratchet.mjs"
+  },
+  "scripts": {
+    "test": "node --test oxlint-ratchet.node.test.mjs"
+  },
+  "files": [
+    "oxlint-ratchet.mjs"
+  ],
+  "author": "Second Nature",
+  "license": "UNLICENSED",
+  "peerDependencies": {
+    "oxlint": "^1.62.0"
+  }
+}
