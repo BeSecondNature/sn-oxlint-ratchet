@@ -481,7 +481,7 @@ const runRatchetOxlint = ({ flags, root, scope, targets }) => {
       'all',
       ...[...scope.rules].flatMap(rule => ['-D', rule]),
       '--format=json',
-      ...flags,
+      ...flags.filter(argument => argument !== '--type-aware'),
       ...targets,
     ],
     {
