@@ -135,6 +135,10 @@ test('adopts and checks a rule at the repository root', () => {
   writeFileSync(path.join(temporaryRoot, 'src/example.ts'), 'oldApi();\n');
 
   writeFileSync(bin, `#!/usr/bin/env node
+const typedFlags = process.argv.filter(argument => argument === '--type-aware');
+if (typedFlags.length !== 1) {
+  throw new Error('Expected exactly one --type-aware argument');
+}
 console.log(JSON.stringify({ diagnostics: [{
   code: 'typescript(no-deprecated)',
   filename: 'src/example.ts',
@@ -159,6 +163,10 @@ console.log(JSON.stringify({ diagnostics: [{
   );
 
   execFileSync('node', [cli, '--ci'], { cwd: temporaryRoot });
+
+  execFileSync('node', [cli, '--type-aware', '--max-warnings=0'], {
+    cwd: temporaryRoot,
+  });
 });
 
 test('allows same-count replacement but blocks an increase', () => {
