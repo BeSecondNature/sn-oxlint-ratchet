@@ -83,6 +83,26 @@ const createRepository = (t, packages = ['a']) => {
   return directory;
 };
 
+const commitRepository = (directory, message) => {
+  execFileSync('git', ['add', '-A'], { cwd: directory });
+
+  execFileSync(
+    'git',
+    [
+      '-c',
+      'user.name=Ratchet tests',
+      '-c',
+      'user.email=ratchet-tests@example.com',
+      '-c',
+      'commit.gpgSign=false',
+      'commit',
+      '-qm',
+      message,
+    ],
+    { cwd: directory },
+  );
+};
+
 // Inject runners to test orchestration without requiring an Oxlint installation.
 const invokeMain = ({
   directory,
@@ -470,7 +490,7 @@ test('does not report improvements outside the covered files', () => {
   assert.deepEqual(result.nextEntries, entries);
 });
 
-test('CI passes improvements and deleted files without rewriting the baseline', t => {
+test('CI without a base notices falls, cleared violations and deleted files without rewriting', t => {
   const directory = createRepository(t);
 
   const ratchetPath = path.join(directory, '.oxlint-ratchet.tsv');
@@ -478,9 +498,12 @@ test('CI passes improvements and deleted files without rewriting the baseline', 
   const source =
     '# Keep this comment and row order.\n' +
     'apps/a/src/gone.ts\ttypescript/no-deprecated\t1\n' +
+    'apps/a/src/cleared.ts\ttypescript/no-deprecated\t1\n' +
     'apps/a/src/example.ts\ttypescript/no-deprecated\t2\n';
 
   writeFileSync(ratchetPath, source);
+
+  writeFileSync(path.join(directory, 'apps/a/src/cleared.ts'), 'newApi();\n');
 
   let ratchetCalls = 0;
 
@@ -511,7 +534,203 @@ test('CI passes improvements and deleted files without rewriting the baseline', 
     /example\.ts: .* fell from 2 to 1; run lint:ratchet/,
   );
 
+  assert.match(
+    result.stdout.join('\n'),
+    /cleared\.ts: .* fell from 1 to 0; run lint:ratchet/,
+  );
+
   assert.equal(readFileSync(ratchetPath, 'utf8'), source);
+});
+
+for (const changed of [true, false]) {
+  for (const outcome of ['rise', 'unallowed', 'fall', 'cleared', 'deleted']) {
+    test(`CI checks ${outcome} in ${changed ? 'changed' : 'unchanged'} files against a Git base`, t => {
+      const directory = createRepository(t);
+
+      const filename = 'apps/a/src/example.ts';
+
+      const ratchetPath = path.join(directory, '.oxlint-ratchet.tsv');
+
+      const source =
+        outcome === 'unallowed'
+          ? '# No allowance.\n'
+          : `${filename}\ttypescript/no-deprecated\t2\n`;
+
+      writeFileSync(ratchetPath, source);
+
+      if (outcome === 'deleted' && !changed) {
+        rmSync(path.join(directory, filename));
+      }
+
+      commitRepository(directory, 'Base');
+
+      if (changed) {
+        if (outcome === 'deleted') {
+          rmSync(path.join(directory, filename));
+        } else {
+          writeFileSync(path.join(directory, filename), 'newApi();\n');
+        }
+      } else {
+        writeFileSync(path.join(directory, 'README.md'), 'Unrelated change.\n');
+      }
+
+      commitRepository(directory, 'Pull request');
+
+      const count = {
+        rise: 3, unallowed: 1, fall: 1, cleared: 0, deleted: 0,
+      }[outcome];
+
+      const calls = [];
+
+      const result = invokeMain({
+        directory,
+        args: ['--ci', '--changed-base', 'HEAD^1', '--max-warnings=0'],
+        runStandard: () => assert.fail('CI must not run standard lint'),
+        runRatchet: request => {
+          calls.push(request);
+
+          return Array.from({ length: count }, () => diagnostic());
+        },
+      });
+
+      assert.equal(calls.length, 1);
+
+      assert.deepEqual(calls[0].flags, ['--max-warnings=0']);
+
+      assert.deepEqual(calls[0].targets, [path.join(directory, 'apps/a')]);
+
+      const regression = outcome === 'rise' || outcome === 'unallowed';
+
+      assert.equal(result.status, regression || changed ? 1 : 0);
+
+      if (regression) {
+        assert.match(result.stderr.join('\n'), /increased from \d to \d/);
+      } else {
+        assert.match(
+          (changed ? result.stderr : result.stdout).join('\n'),
+          /example\.ts: .* fell from 2 to [01]; run lint:ratchet/,
+        );
+
+        assert.deepEqual(changed ? result.stdout : result.stderr, []);
+      }
+
+      assert.equal(readFileSync(ratchetPath, 'utf8'), source);
+    });
+  }
+}
+
+test('CI uses the merge base for strict files and still scans every scope', t => {
+  const directory = createRepository(t, ['a', 'b']);
+
+  const ratchetPath = path.join(directory, '.oxlint-ratchet.tsv');
+
+  const source =
+    'apps/a/src/example.ts\ttypescript/no-deprecated\t2\n' +
+    'apps/b/src/example.ts\ttypescript/no-deprecated\t2\n';
+
+  writeFileSync(ratchetPath, source);
+
+  commitRepository(directory, 'Common ancestor');
+
+  const ancestor = execFileSync('git', ['rev-parse', 'HEAD'], {
+    cwd: directory,
+    encoding: 'utf8',
+  }).trim();
+
+  execFileSync('git', ['checkout', '-qb', 'base'], { cwd: directory });
+
+  writeFileSync(path.join(directory, 'apps/b/src/example.ts'), 'baseApi();\n');
+
+  commitRepository(directory, 'Base branch change');
+
+  execFileSync('git', ['checkout', '-qb', 'pull-request', ancestor], {
+    cwd: directory,
+  });
+
+  writeFileSync(path.join(directory, 'apps/a/src/example.ts'), 'newApi();\n');
+
+  commitRepository(directory, 'Pull request change');
+
+  const calls = [];
+
+  const result = invokeMain({
+    directory,
+    args: ['--ci', '--changed-base', 'base'],
+    runStandard: () => assert.fail('CI must not run standard lint'),
+    runRatchet: ({ scope }) => {
+      const name = path.basename(scope.directory);
+
+      calls.push(name);
+
+      return [diagnostic(`apps/${name}/src/example.ts`)];
+    },
+  });
+
+  assert.equal(result.status, 1);
+
+  assert.deepEqual(calls, ['a', 'b']);
+
+  assert.match(
+    result.stderr.join('\n'),
+    /apps\/a\/src\/example\.ts: .* fell from 2 to 1/,
+  );
+
+  assert.match(
+    result.stdout.join('\n'),
+    /apps\/b\/src\/example\.ts: .* fell from 2 to 1/,
+  );
+
+  assert.equal(result.stderr.length, 1);
+
+  assert.equal(result.stdout.length, 1);
+
+  assert.equal(readFileSync(ratchetPath, 'utf8'), source);
+});
+
+test('CI with an empty changed set still scans and notices improvements', t => {
+  const directory = createRepository(t);
+
+  const ratchetPath = path.join(directory, '.oxlint-ratchet.tsv');
+
+  const source = 'apps/a/src/example.ts\ttypescript/no-deprecated\t2\n';
+
+  writeFileSync(ratchetPath, source);
+
+  commitRepository(directory, 'Base');
+
+  const result = invokeMain({
+    directory,
+    args: ['--ci', '--changed-base', 'HEAD'],
+    runStandard: () => assert.fail('CI must not run standard lint'),
+    runRatchet: () => [diagnostic()],
+  });
+
+  assert.equal(result.status, 0);
+
+  assert.deepEqual(result.stderr, []);
+
+  assert.match(result.stdout.join('\n'), /fell from 2 to 1; run lint:ratchet/);
+
+  assert.equal(readFileSync(ratchetPath, 'utf8'), source);
+});
+
+test('changed-base requires a Git ref', t => {
+  const directory = createRepository(t);
+
+  for (const args of [
+    ['--ci', '--changed-base'],
+    ['--ci', '--changed-base', '--max-warnings=0'],
+  ]) {
+    assert.throws(
+      () => invokeMain({
+        directory,
+        args,
+        runStandard: () => assert.fail('Invalid options must not run lint'),
+        runRatchet: () => assert.fail('Invalid options must not run lint'),
+      }),
+      /--changed-base requires a Git ref/,
+    );
+  }
 });
 
 test('CI still returns a failing exit code for regressions', t => {
@@ -691,7 +910,7 @@ test('standard-only mode skips Oxlint when no existing files changed', t => {
   }
 });
 
-test('full CI plus standard-only avoids repeated ratchet runs with the same outcomes', t => {
+test('full CI with a changed base plus standard-only avoids repeated ratchet runs', t => {
   const directory = createRepository(t, ['a', 'b']);
 
   const ratchetPath = path.join(directory, '.oxlint-ratchet.tsv');
@@ -705,6 +924,7 @@ test('full CI plus standard-only avoids repeated ratchet runs with the same outc
   for (const [aCount, bCount, standardStatus] of [
     [2, 1, 0],
     [1, 0, 0],
+    [2, 0, 0],
     [2, 1, 1],
     [3, 1, 0],
     [2, 2, 0],
@@ -732,10 +952,12 @@ test('full CI plus standard-only avoids repeated ratchet runs with the same outc
 
     const full = invokeMain({
       ...runners,
-      args: ['--ci', '--max-warnings=0'],
+      args: ['--ci', '--changed-base', 'HEAD^1', '--max-warnings=0'],
     });
 
     assert.deepEqual(calls, ['ratchet a', 'ratchet b']);
+
+    assert.equal(full.status, aCount !== 2 || bCount > 1 ? 1 : 0);
 
     calls.length = 0;
 

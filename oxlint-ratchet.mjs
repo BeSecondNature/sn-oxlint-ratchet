@@ -181,6 +181,7 @@ const findScope = (root, scopes, filename, rule) =>
 
 /** Compares diagnostics with the baseline and returns ratchet outcomes. */
 export const classifyDiagnostics = ({
+  changedFiles,
   coveredFiles,
   coveredScopes,
   diagnostics,
@@ -255,7 +256,9 @@ export const classifyDiagnostics = ({
     }
 
     if (frozen) {
-      notices.push(
+      const output = changedFiles?.has(entry.filename) ? messages : notices;
+
+      output.push(
         `${entry.filename}: ${entry.rule} fell from ${entry.count} to ${current}; run lint:ratchet to tighten the ratchet.`,
       );
 
@@ -301,6 +304,7 @@ export const classifyDiagnostics = ({
 const parseOptions = argv => {
   const options = {
     add: undefined,
+    changedBase: undefined,
     diff: undefined,
     frozen: process.env.CI === 'true' || process.env.CI === '1',
     oxlintArgs: [],
@@ -310,6 +314,20 @@ const parseOptions = argv => {
 
   for (let index = 0; index < argv.length; index += 1) {
     const argument = argv[index];
+
+    if (argument === '--changed-base') {
+      const base = argv[index + 1];
+
+      if (!base || base.startsWith('-')) {
+        throw new Error('--changed-base requires a Git ref.');
+      }
+
+      options.changedBase = base;
+
+      index += 1;
+
+      continue;
+    }
 
     if (argument === '--staged' || argument === '--changed') {
       options.diff = argument.slice(2);
@@ -409,11 +427,13 @@ const splitOxlintArgs = args => {
 };
 
 /** Lists changed lintable files for the requested Git diff. */
-const changedFiles = (root, kind) => {
+const changedFiles = (root, kind, base) => {
   const trackedArgs =
-    kind === 'staged'
-      ? ['diff', '--cached', '--name-only', '--diff-filter=ACMRD', 'HEAD', '--']
-      : ['diff', '--name-only', '--diff-filter=ACMRD', 'HEAD', '--'];
+    kind === 'base'
+      ? ['diff', '--name-only', '--diff-filter=ACMRD', `${base}...HEAD`, '--']
+      : kind === 'staged'
+        ? ['diff', '--cached', '--name-only', '--diff-filter=ACMRD', 'HEAD', '--']
+        : ['diff', '--name-only', '--diff-filter=ACMRD', 'HEAD', '--'];
 
   const tracked = git(root, trackedArgs).split('\n').filter(Boolean);
 
@@ -716,6 +736,10 @@ export const main = ({
     return;
   }
 
+  const changedFileSet = options.changedBase
+    ? new Set(listChangedFiles(root, 'base', options.changedBase))
+    : undefined;
+
   const scopes = readScopes(root);
 
   const covered = scopes.filter(scope =>
@@ -743,6 +767,7 @@ export const main = ({
   const fileSet = files ? new Set(files) : undefined;
 
   const result = classifyDiagnostics({
+    changedFiles: changedFileSet,
     coveredFiles: (filename, scope) =>
       fileSet ? fileSet.has(filename) : coveredScopes.has(scope.directory),
     coveredScopes,
