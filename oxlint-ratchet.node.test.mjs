@@ -1,14 +1,23 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import {
+  chmodSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import test from 'node:test';
+import test, { mock } from 'node:test';
 import { fileURLToPath } from 'node:url';
 
 import {
   classifyDiagnostics,
   formatRatchet,
+  main,
   normalizeRule,
   parseRatchet,
   readScopes,
@@ -41,6 +50,93 @@ const classify = ({ diagnostics, entries, frozen = false, scopes = [scope] }) =>
     root,
     scopes,
   });
+
+const createRepository = (t, packages = ['a']) => {
+  const directory = realpathSync(
+    mkdtempSync(path.join(os.tmpdir(), 'ratchet-runners-')),
+  );
+
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+
+  writeFileSync(
+    path.join(directory, 'package.json'),
+    JSON.stringify({ workspaces: ['apps/*'] }),
+  );
+
+  for (const name of packages) {
+    const workspace = path.join(directory, 'apps', name);
+
+    mkdirSync(path.join(workspace, 'src'), { recursive: true });
+
+    writeFileSync(path.join(workspace, 'package.json'), '{}');
+
+    writeFileSync(path.join(workspace, 'src/example.ts'), 'oldApi();\n');
+
+    writeFileSync(
+      path.join(workspace, '.oxlintrc.ratchet.json'),
+      JSON.stringify({ rules: { 'typescript/no-deprecated': 'error' } }),
+    );
+  }
+
+  execFileSync('git', ['init', '-q'], { cwd: directory });
+
+  return directory;
+};
+
+// Inject runners to test orchestration without requiring an Oxlint installation.
+const invokeMain = ({
+  directory,
+  args,
+  listChangedFiles,
+  runStandard,
+  runRatchet,
+}) => {
+  const previousCwd = process.cwd();
+
+  const previousArgv = process.argv;
+
+  const previousExitCode = process.exitCode;
+
+  const previousCI = process.env.CI;
+
+  const stdout = [];
+
+  const stderr = [];
+
+  const log = mock.method(console, 'log', message => stdout.push(message));
+
+  const error = mock.method(console, 'error', message => stderr.push(message));
+
+  try {
+    process.chdir(directory);
+
+    process.argv = ['node', 'oxlint-ratchet.mjs', ...args];
+
+    process.exitCode = undefined;
+
+    process.env.CI = 'false';
+
+    main({ listChangedFiles, runStandard, runRatchet });
+
+    return { status: process.exitCode ?? 0, stderr, stdout };
+  } finally {
+    process.chdir(previousCwd);
+
+    process.argv = previousArgv;
+
+    process.exitCode = previousExitCode;
+
+    if (previousCI === undefined) {
+      delete process.env.CI;
+    } else {
+      process.env.CI = previousCI;
+    }
+
+    log.mock.restore();
+
+    error.mock.restore();
+  }
+};
 
 test('normalizes Oxlint rule names', () => {
   assert.equal(normalizeRule('eslint(eqeqeq)'), 'eqeqeq');
@@ -224,7 +320,7 @@ test('does not carry an allowance between adopted packages', () => {
   assert.equal(result.blockers.length, 1);
 });
 
-test('tightens locally and rejects stale frozen baselines', () => {
+test('tightens locally and reports improvements in frozen baselines', () => {
   const entries = parseRatchet(
     'apps/a/src/example.ts\ttypescript/no-deprecated\t2\n',
   );
@@ -243,10 +339,18 @@ test('tightens locally and rejects stale frozen baselines', () => {
     frozen: true,
   });
 
-  assert.match(frozen.messages[0], /fell from 2 to 1/);
+  assert.equal(frozen.messages.length, 0);
+
+  assert.equal(frozen.blockers.length, 0);
+
+  assert.match(frozen.notices[0], /fell from 2 to 1; run lint:ratchet/);
+
+  assert.deepEqual(frozen.nextEntries, entries);
+
+  assert.equal(frozen.removed, 0);
 });
 
-test('requires package promotion when its debt reaches zero', () => {
+test('reports package promotion when its debt reaches zero', () => {
   const entries = parseRatchet(
     'apps/a/src/example.ts\ttypescript/no-deprecated\t1\n',
   );
@@ -261,5 +365,424 @@ test('requires package promotion when its debt reaches zero', () => {
     frozen: true,
   });
 
-  assert.match(frozen.messages.at(-1), /promote it/);
+  assert.equal(frozen.messages.length, 0);
+
+  assert.match(frozen.notices.at(-1), /promote it/);
+});
+
+test('allows zero remaining violations in CI without removing the row', () => {
+  const entries = parseRatchet(
+    'apps/a/src/example.ts\ttypescript/no-deprecated\t1\n',
+  );
+
+  const result = classify({ diagnostics: [], entries, frozen: true });
+
+  assert.equal(result.messages.length, 0);
+
+  assert.equal(result.blockers.length, 0);
+
+  assert.match(result.notices[0], /fell from 1 to 0; run lint:ratchet/);
+
+  assert.deepEqual(result.nextEntries, entries);
+
+  assert.equal(result.removed, 0);
+});
+
+test('keeps increases and unrecorded file/rule violations as CI failures', () => {
+  const entries = parseRatchet(
+    'apps/a/src/example.ts\ttypescript/no-deprecated\t1\n',
+  );
+
+  const result = classify({
+    diagnostics: [
+      diagnostic(),
+      diagnostic(),
+      diagnostic('apps/a/src/new.ts'),
+      { ...diagnostic(), rule: 'typescript/no-unsafe-assignment' },
+    ],
+    entries,
+    frozen: true,
+    scopes: [
+      {
+        ...scope,
+        rules: new Set([...scope.rules, 'typescript/no-unsafe-assignment']),
+      },
+    ],
+  });
+
+  assert.equal(result.blockers.length, 4);
+
+  assert.equal(result.messages.length, 3);
+
+  assert.match(result.messages[0], /increased from 1 to 2/);
+
+  assert.match(result.messages[1], /new\.ts: .* increased from 0 to 1/);
+
+  assert.match(result.messages[2], /no-unsafe-assignment increased from 0 to 1/);
+
+  assert.deepEqual(result.nextEntries, entries);
+});
+
+test('reports orphaned rows as CI notices and preserves local errors', () => {
+  const entries = parseRatchet(
+    'apps/a/src/example.ts\ttypescript/no-deprecated\t1\n',
+  );
+
+  const frozen = classify({
+    diagnostics: [],
+    entries,
+    frozen: true,
+    scopes: [],
+  });
+
+  assert.equal(frozen.messages.length, 0);
+
+  assert.match(frozen.notices[0], /has no ratchet config/);
+
+  assert.deepEqual(frozen.nextEntries, entries);
+
+  const local = classify({ diagnostics: [], entries, scopes: [] });
+
+  assert.match(local.messages[0], /has no ratchet config/);
+
+  assert.deepEqual(local.nextEntries, entries);
+});
+
+test('does not report improvements outside the covered files', () => {
+  const entries = parseRatchet(
+    'apps/a/src/example.ts\ttypescript/no-deprecated\t1\n',
+  );
+
+  const result = classifyDiagnostics({
+    coveredFiles: () => false,
+    coveredScopes: new Set([scope.directory]),
+    diagnostics: [],
+    entries,
+    frozen: true,
+    root,
+    scopes: [scope],
+  });
+
+  assert.equal(result.messages.length, 0);
+
+  assert.equal(result.notices.length, 0);
+
+  assert.deepEqual(result.nextEntries, entries);
+});
+
+test('CI passes improvements and deleted files without rewriting the baseline', t => {
+  const directory = createRepository(t);
+
+  const ratchetPath = path.join(directory, '.oxlint-ratchet.tsv');
+
+  const source =
+    '# Keep this comment and row order.\n' +
+    'apps/a/src/gone.ts\ttypescript/no-deprecated\t1\n' +
+    'apps/a/src/example.ts\ttypescript/no-deprecated\t2\n';
+
+  writeFileSync(ratchetPath, source);
+
+  let ratchetCalls = 0;
+
+  const result = invokeMain({
+    directory,
+    args: ['--ci', '--max-warnings=0'],
+    runStandard: () => assert.fail('CI must not run standard lint'),
+    runRatchet: () => {
+      ratchetCalls += 1;
+
+      return [diagnostic()];
+    },
+  });
+
+  assert.equal(result.status, 0);
+
+  assert.equal(ratchetCalls, 1);
+
+  assert.deepEqual(result.stderr, []);
+
+  assert.match(
+    result.stdout.join('\n'),
+    /gone\.ts: .* fell from 1 to 0; run lint:ratchet/,
+  );
+
+  assert.match(
+    result.stdout.join('\n'),
+    /example\.ts: .* fell from 2 to 1; run lint:ratchet/,
+  );
+
+  assert.equal(readFileSync(ratchetPath, 'utf8'), source);
+});
+
+test('CI still returns a failing exit code for regressions', t => {
+  const directory = createRepository(t);
+
+  const ratchetPath = path.join(directory, '.oxlint-ratchet.tsv');
+
+  const source = 'apps/a/src/example.ts\ttypescript/no-deprecated\t1\n';
+
+  writeFileSync(ratchetPath, source);
+
+  const result = invokeMain({
+    directory,
+    args: ['--ci'],
+    runStandard: () => assert.fail('CI must not run standard lint'),
+    runRatchet: () => [
+      diagnostic(),
+      diagnostic(),
+      diagnostic('apps/a/src/new.ts'),
+    ],
+  });
+
+  assert.equal(result.status, 1);
+
+  assert.match(result.stderr.join('\n'), /increased from 1 to 2/);
+
+  assert.match(result.stderr.join('\n'), /increased from 0 to 1/);
+
+  assert.equal(readFileSync(ratchetPath, 'utf8'), source);
+});
+
+test('local ratchet-only mode still tightens and removes cleared rows', t => {
+  const directory = createRepository(t);
+
+  const ratchetPath = path.join(directory, '.oxlint-ratchet.tsv');
+
+  writeFileSync(
+    ratchetPath,
+    'apps/a/src/example.ts\ttypescript/no-deprecated\t2\n' +
+    'apps/a/src/gone.ts\ttypescript/no-deprecated\t1\n',
+  );
+
+  const result = invokeMain({
+    directory,
+    args: ['--ratchet-only'],
+    runStandard: () =>
+      assert.fail('Ratchet-only mode must not run standard lint'),
+    runRatchet: () => [diagnostic()],
+  });
+
+  assert.equal(result.status, 0);
+
+  assert.equal(
+    readFileSync(ratchetPath, 'utf8'),
+    '# file\trule\tallowed errors\napps/a/src/example.ts\ttypescript/no-deprecated\t1\n',
+  );
+
+  assert.match(
+    result.stdout.join('\n'),
+    /Tightened the lint ratchet by 2 violation\(s\)/,
+  );
+});
+
+test('standard-only mode forwards flags and targets without reading the ratchet', t => {
+  const directory = createRepository(t);
+
+  const ratchetPath = path.join(directory, '.oxlint-ratchet.tsv');
+
+  const source = 'This baseline must not be read or rewritten.\n';
+
+  writeFileSync(ratchetPath, source);
+
+  const calls = [];
+
+  const result = invokeMain({
+    directory: path.join(directory, 'apps/a'),
+    args: ['--standard-only', '--type-aware', '--max-warnings=0', 'src'],
+    runStandard: request => {
+      calls.push(request);
+
+      return 0;
+    },
+    runRatchet: () =>
+      assert.fail('Standard-only mode must not run ratchet lint'),
+  });
+
+  assert.equal(result.status, 0);
+
+  assert.deepEqual(calls, [
+    {
+      args: ['--type-aware', '--max-warnings=0', 'src'],
+      cwd: path.join(directory, 'apps/a'),
+      root: directory,
+    },
+  ]);
+
+  assert.equal(readFileSync(ratchetPath, 'utf8'), source);
+});
+
+test('standard-only mode preserves standard lint failures', t => {
+  const directory = createRepository(t);
+
+  for (const status of [1, 2]) {
+    const result = invokeMain({
+      directory,
+      args: ['--standard-only'],
+      runStandard: () => status,
+      runRatchet: () =>
+        assert.fail('Standard-only mode must not run ratchet lint'),
+    });
+
+    assert.equal(result.status, 1);
+  }
+});
+
+test('standard-only mode preserves changed and staged file selection', t => {
+  const directory = createRepository(t);
+
+  for (const mode of ['changed', 'staged']) {
+    const calls = [];
+
+    const result = invokeMain({
+      directory,
+      args: [
+        '--standard-only',
+        `--${mode}`,
+        '--type-aware',
+        '--max-warnings=0',
+      ],
+      listChangedFiles: (root, kind) => {
+        assert.equal(root, directory);
+
+        assert.equal(kind, mode);
+
+        return ['apps/a/src/example.ts', 'apps/a/src/gone.ts'];
+      },
+      runStandard: request => {
+        calls.push(request);
+
+        return 0;
+      },
+      runRatchet: () =>
+        assert.fail('Standard-only mode must not run ratchet lint'),
+    });
+
+    assert.equal(result.status, 0);
+
+    assert.deepEqual(calls, [
+      {
+        args: [
+          '--type-aware',
+          '--max-warnings=0',
+          path.join(directory, 'apps/a/src/example.ts'),
+        ],
+        cwd: directory,
+        root: directory,
+      },
+    ]);
+  }
+});
+
+test('standard-only mode skips Oxlint when no existing files changed', t => {
+  const directory = createRepository(t);
+
+  for (const files of [[], ['apps/a/src/gone.ts']]) {
+    const result = invokeMain({
+      directory,
+      args: ['--standard-only', '--changed'],
+      listChangedFiles: () => files,
+      runStandard: () =>
+        assert.fail('There are no existing changed files to lint'),
+      runRatchet: () =>
+        assert.fail('Standard-only mode must not run ratchet lint'),
+    });
+
+    assert.equal(result.status, 0);
+  }
+});
+
+test('full CI plus standard-only avoids repeated ratchet runs with the same outcomes', t => {
+  const directory = createRepository(t, ['a', 'b']);
+
+  const ratchetPath = path.join(directory, '.oxlint-ratchet.tsv');
+
+  const source =
+    'apps/a/src/example.ts\ttypescript/no-deprecated\t2\n' +
+    'apps/b/src/example.ts\ttypescript/no-deprecated\t1\n';
+
+  writeFileSync(ratchetPath, source);
+
+  for (const [aCount, bCount, standardStatus] of [
+    [2, 1, 0],
+    [1, 0, 0],
+    [2, 1, 1],
+    [3, 1, 0],
+    [2, 2, 0],
+  ]) {
+    const calls = [];
+
+    const runners = {
+      directory,
+      listChangedFiles: () => ['apps/a/src/example.ts'],
+      runStandard: () => {
+        calls.push('standard');
+
+        return standardStatus;
+      },
+      runRatchet: ({ scope }) => {
+        const name = path.basename(scope.directory);
+
+        calls.push(`ratchet ${name}`);
+
+        return Array.from({ length: name === 'a' ? aCount : bCount }, () =>
+          diagnostic(`apps/${name}/src/example.ts`),
+        );
+      },
+    };
+
+    const full = invokeMain({
+      ...runners,
+      args: ['--ci', '--max-warnings=0'],
+    });
+
+    assert.deepEqual(calls, ['ratchet a', 'ratchet b']);
+
+    calls.length = 0;
+
+    const oldAgent = invokeMain({
+      ...runners,
+      args: ['--changed', '--frozen', '--type-aware', '--max-warnings=0'],
+    });
+
+    assert.deepEqual(calls, ['standard', 'ratchet a']);
+
+    calls.length = 0;
+
+    const newAgent = invokeMain({
+      ...runners,
+      args: [
+        '--changed',
+        '--standard-only',
+        '--type-aware',
+        '--max-warnings=0',
+      ],
+    });
+
+    assert.deepEqual(calls, ['standard']);
+
+    assert.equal(full.status || newAgent.status, full.status || oldAgent.status);
+
+    assert.equal(readFileSync(ratchetPath, 'utf8'), source);
+  }
+});
+
+test('standard-only mode rejects conflicting ratchet modes in either order', t => {
+  const directory = createRepository(t);
+
+  for (const mode of [['--ci'], ['--ratchet-only'], ['--add', '.', 'eqeqeq']]) {
+    for (const args of [
+      ['--standard-only', ...mode],
+      [...mode, '--standard-only'],
+    ]) {
+      assert.throws(
+        () => invokeMain({
+          directory,
+          args,
+          runStandard: () => assert.fail('Conflicting modes must not run lint'),
+          runRatchet: () => assert.fail('Conflicting modes must not run lint'),
+        }),
+        /--standard-only cannot be combined/,
+      );
+    }
+  }
 });

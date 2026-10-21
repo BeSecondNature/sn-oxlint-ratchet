@@ -235,7 +235,9 @@ export const classifyDiagnostics = ({
     const scope = findScope(root, scopes, entry.filename, entry.rule);
 
     if (!scope) {
-      messages.push(
+      const output = frozen ? notices : messages;
+
+      output.push(
         `${entry.filename}: ${entry.rule} has no ratchet config.`,
       );
 
@@ -253,8 +255,8 @@ export const classifyDiagnostics = ({
     }
 
     if (frozen) {
-      messages.push(
-        `${entry.filename}: ${entry.rule} fell from ${entry.count} to ${current}; run lint locally to tighten the ratchet.`,
+      notices.push(
+        `${entry.filename}: ${entry.rule} fell from ${entry.count} to ${current}; run lint:ratchet to tighten the ratchet.`,
       );
 
       continue;
@@ -288,11 +290,7 @@ export const classifyDiagnostics = ({
         path.relative(root, scope.directory),
       )}: ${rule} has no debt; promote it to the normal Oxlint config.`;
 
-      if (frozen) {
-        messages.push(message);
-      } else {
-        notices.push(message);
-      }
+      notices.push(message);
     }
   }
 
@@ -307,6 +305,7 @@ const parseOptions = argv => {
     frozen: process.env.CI === 'true' || process.env.CI === '1',
     oxlintArgs: [],
     ratchetOnly: false,
+    standardOnly: false,
   };
 
   for (let index = 0; index < argv.length; index += 1) {
@@ -328,6 +327,12 @@ const parseOptions = argv => {
 
     if (argument === '--ratchet-only') {
       options.ratchetOnly = true;
+
+      continue;
+    }
+
+    if (argument === '--standard-only') {
+      options.standardOnly = true;
 
       continue;
     }
@@ -357,6 +362,12 @@ const parseOptions = argv => {
     }
 
     options.oxlintArgs.push(argument);
+  }
+
+  if (options.standardOnly && options.ratchetOnly) {
+    throw new Error(
+      '--standard-only cannot be combined with --ci, --ratchet-only or --add.',
+    );
   }
 
   return options;
@@ -650,7 +661,11 @@ const addRule = ({ packagePath, rule }, root, ratchetPath) => {
 };
 
 /** Runs the ratchet CLI. */
-export const main = () => {
+export const main = ({
+  listChangedFiles = changedFiles,
+  runStandard = runStandardOxlint,
+  runRatchet = runRatchetOxlint,
+} = {}) => {
   const cwd = process.cwd();
 
   const root = git(cwd, ['rev-parse', '--show-toplevel']);
@@ -669,7 +684,7 @@ export const main = () => {
     options.oxlintArgs,
   );
 
-  const files = options.diff ? changedFiles(root, options.diff) : undefined;
+  const files = options.diff ? listChangedFiles(root, options.diff) : undefined;
 
   if (options.diff && files.length === 0) {
     console.log('No changed JavaScript or TypeScript files to lint.');
@@ -687,11 +702,19 @@ export const main = () => {
     ? 0
     : standardTargets?.length === 0
       ? 0
-      : runStandardOxlint({
+      : runStandard({
           args: [...flags, ...(standardTargets ?? requestedTargets)],
           cwd,
           root,
         });
+
+  if (options.standardOnly) {
+    if (standardStatus !== 0) {
+      process.exitCode = 1;
+    }
+
+    return;
+  }
 
   const scopes = readScopes(root);
 
@@ -712,7 +735,7 @@ export const main = () => {
 
     return scopeTargets.length === 0
       ? []
-      : runRatchetOxlint({ flags, root, scope, targets: scopeTargets });
+      : runRatchet({ flags, root, scope, targets: scopeTargets });
   });
 
   const entries = readRatchet(ratchetPath);
